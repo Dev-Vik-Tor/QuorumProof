@@ -5,16 +5,20 @@ export interface WalletState {
   address: string | null;
   wallets: string[];
   walletType: WalletType | null;
+  /** BIP-44 account index persisted alongside the active wallet type. */
+  accountIndex: number;
   activeIndex: number;
+  accountIndex: number;
   isConnected: boolean;
   hasFreighter: boolean;
   isInitializing: boolean;
   network: string;
   error: string | null;
   availableWallets: WalletType[];
-  connect: (type?: WalletType) => Promise<void>;
+  connect: (type?: WalletType, accountIndex?: number) => Promise<void>;
   disconnect: () => void;
   switchWallet: (index: number) => void;
+  setAccountIndexForWallet: (walletIndex: number, accountIndex: number) => void;
 }
 
 export const WalletContext = createContext<WalletState | undefined>(undefined);
