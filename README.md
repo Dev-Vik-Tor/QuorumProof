@@ -40,6 +40,12 @@ Real **BLS12-381 pairing-based** Groth16 and PLONK verification is implemented i
 > Callers must compress off-chain before storing metadata.
 > Tracked in [#1417](https://github.com/cryptonautt/QuorumProof/issues/1417).
 
+> **`create_disclosure_proof` / `verify_disclosure` are bound but not private.** They provide
+> an on-chain commitment binding a proof to the exact `(credential_id, fields_to_reveal)` pair it
+> was created for, rejecting any proof that doesn't match — but `fields_to_reveal` is not hidden
+> from the chain and no zero-knowledge property is provided. Real selective-disclosure ZK proofs
+> are tracked alongside the items above.
+
 ## 🚀 Features
 
 - **Audit Slices**: Define your own quorum of trusted attestors (university, licensing body, employers)
