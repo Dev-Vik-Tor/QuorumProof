@@ -37,6 +37,8 @@ mod bbs_plus_tests;
 mod upgrade_safety_tests;
 #[cfg(test)]
 mod formal_verification_invariants;
+#[cfg(test)]
+mod tests_governance_1511;
 
 const TOPIC_ISSUE: &str = "CredentialIssued";
 const TOPIC_REVOKE: &str = "RevokeCredential";
@@ -67,6 +69,7 @@ const TOPIC_TEMPLATE_UPDATED: &str = "TemplateUpdated";
 const TOPIC_ATTESTOR_REPLACEMENT: &str = "AttestorReplaced";
 const TOPIC_KEY_ESCROW_DEPOSITED: &str = "KeyEscrowDeposited";
 const TOPIC_KEY_ESCROW_RECOVERED: &str = "KeyEscrowRecovered";
+const TOPIC_KEY_ESCROW_ROTATED: &str = "KeyEscrowRotated";
 /// `migration::MigrationJob.kind` tag for credential-metadata-schema migrations.
 const MIGRATION_KIND_METADATA_SCHEMA: u32 = 1;
 const STANDARD_TTL: u32 = 16_384;
@@ -121,6 +124,10 @@ const TOPIC_ROLE_GRANTED: &str = "RoleGranted";
 const TOPIC_ROLE_REVOKED: &str = "RoleRevoked";
 const TOPIC_ROLE_DELEGATED: &str = "RoleDelegated";
 const TOPIC_ROLE_DELEGATION_REVOKED: &str = "RoleDelegationRevoked";
+
+// ── Issue #1511: Governance audit trail for cross-contract address repointing ──
+const TOPIC_ADMIN_TRANSFERRED: &str = "AdminTransferred";
+const TOPIC_CONTRACT_ADDRESS_UPDATED: &str = "ContractAddressUpdated";
 
 #[contracttype]
 #[derive(Clone)]
@@ -842,6 +849,14 @@ pub enum ContractError {
     InsufficientShares = 92,
     /// Referenced slice schema version is not registered
     SchemaNotFound = 93,
+    /// Issue #1394: Attempted to purge a role assignment/delegation that has not expired yet
+    GrantNotExpired = 94,
+    /// Issue #1510: Attestor independence — the credential subject cannot be an attestor
+    /// in a slice used to attest their own credential when enforcement is enabled.
+    SubjectIsAttestor = 96,
+    /// Issue #1510: Attestor independence — the credential issuer cannot be an attestor
+    /// in a slice used to attest their own credential when enforcement is enabled.
+    IssuerIsAttestor = 97,
 }
 
 #[contracttype]
@@ -917,6 +932,10 @@ pub enum DataKey {
     SuccessfulVerificationCount,
     /// Issue #1389: Number of verification calls that failed.
     FailedVerificationCount,
+    /// Issue #1511: Stored SBT registry contract address for governance repointing.
+    SbtRegistryId,
+    /// Issue #1511: Stored ZK verifier contract address for governance repointing.
+    ZkVerifierId,
 }
 
 #[contracttype]
@@ -1035,6 +1054,10 @@ pub enum DataKey10 {
     SliceDelegation(u64, Address),
     /// Issue #898: Configurable max attestors per slice
     MaxAttestorsPerSlice,
+    /// Issue #1510: Flag controlling attestor-independence enforcement.
+    /// When true, the credential subject and issuer are rejected as attestors
+    /// in any slice used to attest their own credential.
+    AttestorIndependenceEnabled,
     /// Issue #876: Which version of the credential type definition a credential was issued against
     CredentialTypeDefVersion(u64),
     /// Issue #876: Historical versions of a credential type definition (type_id -> Vec<CredentialTypeDef>)
@@ -1967,6 +1990,30 @@ pub struct AttestorReplacementRecord {
     pub reason: String,
 }
 
+// ── Issue #1511: Governance audit trail event structs ────────────────────────
+
+/// Emitted when the contract admin is transferred to a new address.
+#[contracttype]
+#[derive(Clone)]
+pub struct AdminTransferredEventData {
+    /// The previous admin address.
+    pub old_admin: Address,
+    /// The new admin address.
+    pub new_admin: Address,
+}
+
+/// Emitted when a cross-contract address (sbt_registry or zk_verifier) is repointed.
+#[contracttype]
+#[derive(Clone)]
+pub struct ContractAddressUpdatedEventData {
+    /// The label identifying which contract was updated (e.g. "sbt_registry", "zk_verifier").
+    pub contract_name: soroban_sdk::String,
+    /// The previous contract address.
+    pub old_address: Address,
+    /// The new contract address.
+    pub new_address: Address,
+}
+
 /// Result of [`check_health`]: a point-in-time contract health summary.
 #[contracttype]
 #[derive(Clone)]
@@ -2622,6 +2669,33 @@ pub struct CongestionConfig {
     pub max_max_calls: u32,
 }
 
+/// Issue #1397: Combined read-only snapshot of all three independent
+/// throttling systems (circuit breaker, rate limiting, congestion), so an
+/// operator/dashboard can read all of their current state in one round trip
+/// instead of calling each system's getters separately. See
+/// `docs/throttling.md` for how these systems interact and their precedence
+/// order when more than one applies to a single call.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ThrottlingStatus {
+    /// Circuit breaker: current operational state (Normal/Degraded/Paused).
+    pub circuit_breaker_state: circuit_breaker::CircuitBreakerState,
+    /// Circuit breaker: active degradation/pause details, if any.
+    pub circuit_breaker_activation: Option<circuit_breaker::CircuitBreakerActivation>,
+    /// Circuit breaker: max writes allowed per ledger while Degraded.
+    pub degraded_write_limit: u32,
+    /// Circuit breaker: writes recorded in the current Degraded window.
+    pub degraded_write_count: u32,
+    /// Rate limiting: global (default) max calls per window.
+    pub rate_limit_max_calls: u32,
+    /// Rate limiting: global (default) window length in seconds.
+    pub rate_limit_window_seconds: u64,
+    /// Congestion: current classification (Low/Normal/High).
+    pub congestion_level: CongestionLevel,
+    /// Congestion: thresholds/factors driving automatic rate-limit adjustment.
+    pub congestion_config: CongestionConfig,
+}
+
 // ── Feature (b): Admin bypass for emergency attestations ─────────────────────
 
 /// Audit record written every time the admin bypass is exercised.
@@ -2891,6 +2965,7 @@ impl QuorumProofContract {
         key_type: DidKeyType,
         public_key: soroban_sdk::Bytes,
     ) {
+        Self::enforce_write_limit(&env);
         crate::did::register_did(&env, address, did, key_type, public_key);
     }
 
@@ -2914,12 +2989,14 @@ impl QuorumProofContract {
         new_key_type: DidKeyType,
         new_public_key: soroban_sdk::Bytes,
     ) {
+        Self::enforce_write_limit(&env);
         crate::did::update_did(&env, address, new_key_type, new_public_key);
     }
 
     /// Deactivate a DID document. The DID entry is marked inactive but
     /// remains on-chain for resolution and audit purposes.
     pub fn deactivate_did(env: Env, address: Address) {
+        Self::enforce_write_limit(&env);
         crate::did::deactivate_did(&env, address);
     }
 
@@ -3419,6 +3496,13 @@ impl QuorumProofContract {
         state_metrics::collect(&env)
     }
 
+    /// Per-action credential lifecycle counters (`"credential"` for issuance,
+    /// `"revocation"` for revocation), as a map of action label to event
+    /// count. Unauthenticated and O(1), like `get_state_metrics`.
+    pub fn get_credential_action_counts(env: Env) -> soroban_sdk::Map<String, u64> {
+        state_metrics::get_credential_action_counts(&env)
+    }
+
     /// Return the schema version distribution across all credentials.
     /// Scans all credential IDs from 1 to current count and returns counts per schema version.
     pub fn get_metadata_schema_distribution(env: Env) -> soroban_sdk::Map<u32, u32> {
@@ -3518,6 +3602,137 @@ impl QuorumProofContract {
             .extend_ttl(STANDARD_TTL, EXTENDED_TTL);
     }
 
+    // ── Issue #1511: Governance — admin transfer & cross-contract address repointing ──
+
+    /// Transfer contract admin to a new address, emitting an `AdminTransferred` event.
+    ///
+    /// This provides an auditable trail for every admin key rotation. The caller
+    /// must be the current admin and must authorize the call.
+    ///
+    /// # Parameters
+    /// - `admin`: The current admin address (must authorize).
+    /// - `new_admin`: The address to become the new admin.
+    ///
+    /// # Panics
+    /// - If the contract is not initialized (no admin stored).
+    /// - If `admin` does not match the stored admin.
+    pub fn update_admin(env: Env, admin: Address, new_admin: Address) {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        assert!(stored == admin, "unauthorized");
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().extend_ttl(STANDARD_TTL, EXTENDED_TTL);
+
+        let event_data = AdminTransferredEventData {
+            old_admin: stored,
+            new_admin,
+        };
+        let topic = soroban_sdk::String::from_str(&env, TOPIC_ADMIN_TRANSFERRED);
+        let mut topics: soroban_sdk::Vec<soroban_sdk::String> = soroban_sdk::Vec::new(&env);
+        topics.push_back(topic);
+        env.events().publish(topics, event_data);
+    }
+
+    /// Store or repoint the SBT registry contract address, emitting a
+    /// `ContractAddressUpdated` event with the old and new addresses.
+    ///
+    /// Useful when the SBT registry is redeployed and cross-contract calls
+    /// must be directed to the new address without redeploying this contract.
+    ///
+    /// # Parameters
+    /// - `admin`: The current admin address (must authorize).
+    /// - `new_address`: The new SBT registry contract address.
+    ///
+    /// # Panics
+    /// - If the contract is not initialized.
+    /// - If `admin` does not match the stored admin.
+    pub fn update_sbt_registry_address(env: Env, admin: Address, new_address: Address) {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        assert!(stored == admin, "unauthorized");
+
+        let old_address: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SbtRegistryId);
+
+        env.storage().instance().set(&DataKey::SbtRegistryId, &new_address);
+        env.storage().instance().extend_ttl(STANDARD_TTL, EXTENDED_TTL);
+
+        // Use the new_address as a stand-in for old when first set (no prior value)
+        let old_addr = old_address.unwrap_or(new_address.clone());
+        let event_data = ContractAddressUpdatedEventData {
+            contract_name: soroban_sdk::String::from_str(&env, "sbt_registry"),
+            old_address: old_addr,
+            new_address,
+        };
+        let topic = soroban_sdk::String::from_str(&env, TOPIC_CONTRACT_ADDRESS_UPDATED);
+        let mut topics: soroban_sdk::Vec<soroban_sdk::String> = soroban_sdk::Vec::new(&env);
+        topics.push_back(topic);
+        env.events().publish(topics, event_data);
+    }
+
+    /// Store or repoint the ZK verifier contract address, emitting a
+    /// `ContractAddressUpdated` event with the old and new addresses.
+    ///
+    /// Useful when the ZK verifier is redeployed and cross-contract calls
+    /// must be directed to the new address without redeploying this contract.
+    ///
+    /// # Parameters
+    /// - `admin`: The current admin address (must authorize).
+    /// - `new_address`: The new ZK verifier contract address.
+    ///
+    /// # Panics
+    /// - If the contract is not initialized.
+    /// - If `admin` does not match the stored admin.
+    pub fn update_zk_verifier_address(env: Env, admin: Address, new_address: Address) {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        assert!(stored == admin, "unauthorized");
+
+        let old_address: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ZkVerifierId);
+
+        env.storage().instance().set(&DataKey::ZkVerifierId, &new_address);
+        env.storage().instance().extend_ttl(STANDARD_TTL, EXTENDED_TTL);
+
+        let old_addr = old_address.unwrap_or(new_address.clone());
+        let event_data = ContractAddressUpdatedEventData {
+            contract_name: soroban_sdk::String::from_str(&env, "zk_verifier"),
+            old_address: old_addr,
+            new_address,
+        };
+        let topic = soroban_sdk::String::from_str(&env, TOPIC_CONTRACT_ADDRESS_UPDATED);
+        let mut topics: soroban_sdk::Vec<soroban_sdk::String> = soroban_sdk::Vec::new(&env);
+        topics.push_back(topic);
+        env.events().publish(topics, event_data);
+    }
+
+    /// Get the currently stored SBT registry address, if any.
+    pub fn get_sbt_registry_address(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::SbtRegistryId)
+    }
+
+    /// Get the currently stored ZK verifier address, if any.
+    pub fn get_zk_verifier_address(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::ZkVerifierId)
+    }
+
     /// Returns true if the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
         env.storage()
@@ -3577,6 +3792,22 @@ impl QuorumProofContract {
     /// Read the current circuit breaker configuration.
     pub fn get_circuit_breaker_config(env: Env) -> circuit_breaker::CircuitBreakerConfig {
         circuit_breaker::get_config(&env)
+    }
+
+    /// Apply only the circuit breaker's degraded-mode write cap (issue #1393).
+    ///
+    /// Mutating entry points that deliberately stay callable while the contract
+    /// is paused — or that predate `require_not_paused` and whose pause
+    /// semantics must not change — call this instead, so the Degraded-state
+    /// write cap is contract-wide rather than covering only the
+    /// `require_not_paused` paths. Entry points already calling
+    /// `require_not_paused` are covered by it and must not call this too, or
+    /// they would consume two write slots per call.
+    fn enforce_write_limit(env: &Env) {
+        circuit_breaker::check_and_recover(env);
+        if let Err(e) = circuit_breaker::enforce_degraded_write_limit(env) {
+            panic_with_error!(env, e);
+        }
     }
 
     fn require_not_paused(env: &Env) {
@@ -3906,6 +4137,23 @@ impl QuorumProofContract {
             .get::<_, NetworkCongestionMetrics>(&DataKey10::CongestionMetrics)
             .map(|m| m.level)
             .unwrap_or(CongestionLevel::Normal)
+    }
+
+    /// Issue #1397: Read the current state of all three independent
+    /// throttling systems (circuit breaker, rate limiting, congestion) in a
+    /// single round trip. See `docs/throttling.md` for how they interact.
+    pub fn get_throttling_status(env: Env) -> ThrottlingStatus {
+        let rate_limit_config = Self::get_rate_limit_config(&env);
+        ThrottlingStatus {
+            circuit_breaker_state: circuit_breaker::get_state(&env),
+            circuit_breaker_activation: circuit_breaker::get_activation(&env),
+            degraded_write_limit: circuit_breaker::get_config(&env).degraded_write_limit,
+            degraded_write_count: circuit_breaker::get_degraded_write_count(&env),
+            rate_limit_max_calls: rate_limit_config.max_calls,
+            rate_limit_window_seconds: rate_limit_config.window_seconds,
+            congestion_level: Self::get_congestion_level(env.clone()),
+            congestion_config: Self::get_congestion_config(env),
+        }
     }
 
     // ── Feature (b): Admin bypass for urgent / emergency attestations ──────────
@@ -6163,7 +6411,7 @@ impl QuorumProofContract {
             let type_def: CredentialTypeDef = env.storage()
                 .instance()
                 .get(&DataKey::CredentialType(credential_type))
-                .unwrap();
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::CredentialTypeNotFound));
             env.storage()
                 .instance()
                 .set(&DataKey10::CredentialTypeDefVersion(id), &type_def.version);
@@ -6405,7 +6653,7 @@ impl QuorumProofContract {
             let type_def: CredentialTypeDef = env.storage()
                 .instance()
                 .get(&DataKey::CredentialType(credential_type))
-                .unwrap();
+                .unwrap_or_else(|| panic_with_error!(env, ContractError::CredentialTypeNotFound));
             env.storage()
                 .instance()
                 .set(&DataKey10::CredentialTypeDefVersion(id), &type_def.version);
@@ -8581,6 +8829,7 @@ impl QuorumProofContract {
     /// If the removal would make the threshold unreachable, the threshold is clamped to the new total weight.
     pub fn remove_attestor(env: Env, creator: Address, slice_id: u64, attestor: Address) {
         creator.require_auth();
+        Self::enforce_write_limit(&env);
         let mut slice: QuorumSlice = env
             .storage()
             .instance()
@@ -8642,6 +8891,7 @@ impl QuorumProofContract {
     /// the total weight sum (existing + new attestor).
     pub fn add_attestor(env: Env, creator: Address, slice_id: u64, attestor: Address, weight: u32) {
         creator.require_auth();
+        Self::enforce_write_limit(&env);
         Self::require_valid_address(&env, &creator);
         Self::require_valid_address(&env, &attestor);
         let mut slice: QuorumSlice = env
@@ -8707,6 +8957,7 @@ impl QuorumProofContract {
         new_weight: u32,
     ) {
         creator.require_auth();
+        Self::enforce_write_limit(&env);
         Self::validate_weight(new_weight);
         let mut slice: QuorumSlice = env
             .storage()
@@ -8722,7 +8973,10 @@ impl QuorumProofContract {
             .iter()
             .position(|candidate| candidate == attestor)
             .expect("attestor not in slice") as u32;
-        let old_weight = slice.weights.get(position).unwrap();
+        let old_weight = slice
+            .weights
+            .get(position)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInSlice));
         slice.weights.set(position, new_weight);
 
         let total_weight = Self::total_slice_weight(&slice.weights);
@@ -8779,6 +9033,7 @@ impl QuorumProofContract {
     /// Must be greater than 0 and cannot exceed the total weight sum of all attestors.
     pub fn update_slice_threshold(env: Env, creator: Address, slice_id: u64, new_threshold: u32) {
         creator.require_auth();
+        Self::enforce_write_limit(&env);
         let mut slice: QuorumSlice = env
             .storage()
             .instance()
@@ -8865,6 +9120,7 @@ impl QuorumProofContract {
         percentage: u32,
     ) {
         creator.require_auth();
+        Self::enforce_write_limit(&env);
         assert!(
             (1..=100).contains(&percentage),
             "percentage threshold must be between 1 and 100"
@@ -8973,6 +9229,7 @@ impl QuorumProofContract {
         expires_at: Option<u64>,
     ) {
         delegator.require_auth();
+        Self::enforce_write_limit(&env);
         Self::require_valid_address(&env, &delegator);
         Self::require_valid_address(&env, &delegate);
 
@@ -9038,6 +9295,7 @@ impl QuorumProofContract {
     /// Issue #896: Revoke a vote delegation
     pub fn revoke_slice_delegation(env: Env, delegator: Address, slice_id: u64) {
         delegator.require_auth();
+        Self::enforce_write_limit(&env);
 
         let delegation: SliceDelegation = env
             .storage()
@@ -9157,6 +9415,83 @@ impl QuorumProofContract {
             .instance()
             .get(&DataKey10::MaxAttestorsPerSlice)
             .unwrap_or(MAX_ATTESTORS_PER_SLICE)
+    }
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // Issue #1510: Attestor-independence enforcement
+    // ────────────────────────────────────────────────────────────────────────────
+
+    /// Enable attestor-independence enforcement (admin only).
+    ///
+    /// Once enabled, `attest()` will reject calls where the attesting party
+    /// is the credential's subject (`SubjectIsAttestor`) or its issuer
+    /// (`IssuerIsAttestor`).  This prevents self-serving attestations and
+    /// ensures every attestor is a genuinely independent third party.
+    ///
+    /// Idempotent — calling while already enabled is a no-op.
+    pub fn enable_attestor_independence(env: Env, admin: Address) {
+        admin.require_auth();
+        assert!(
+            Self::is_admin(&env, admin),
+            "only admin can enable attestor independence"
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey10::AttestorIndependenceEnabled, &true);
+        env.storage()
+            .instance()
+            .extend_ttl(STANDARD_TTL, EXTENDED_TTL);
+    }
+
+    /// Disable attestor-independence enforcement (admin only).
+    ///
+    /// Reverts to the legacy permissive behaviour where subjects and issuers
+    /// may attest their own credentials.  Intended for emergency rollback only.
+    ///
+    /// Idempotent — calling while already disabled is a no-op.
+    pub fn disable_attestor_independence(env: Env, admin: Address) {
+        admin.require_auth();
+        assert!(
+            Self::is_admin(&env, admin),
+            "only admin can disable attestor independence"
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey10::AttestorIndependenceEnabled, &false);
+        env.storage()
+            .instance()
+            .extend_ttl(STANDARD_TTL, EXTENDED_TTL);
+    }
+
+    /// Returns `true` if attestor-independence enforcement is currently active.
+    ///
+    /// Defaults to `false` (disabled) on freshly-initialised contracts so that
+    /// existing deployments are not broken by the upgrade.
+    pub fn is_attestor_independence_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey10::AttestorIndependenceEnabled)
+            .unwrap_or(false)
+    }
+
+    /// Internal helper: assert that `attestor` is independent from the
+    /// credential's subject and issuer when the independence flag is enabled.
+    ///
+    /// Called from [`attest`] after the credential has been loaded.
+    fn require_attestor_independence(
+        env: &Env,
+        attestor: &Address,
+        credential: &Credential,
+    ) {
+        if !Self::is_attestor_independence_enabled(env.clone()) {
+            return;
+        }
+        if attestor == &credential.subject {
+            panic_with_error!(env, ContractError::SubjectIsAttestor);
+        }
+        if attestor == &credential.issuer {
+            panic_with_error!(env, ContractError::IssuerIsAttestor);
+        }
     }
 
     /// Attest a credential using a quorum slice.
@@ -9593,6 +9928,8 @@ impl QuorumProofContract {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::CredentialNotFound));
         assert!(!credential.revoked, "credential is revoked");
         assert!(!credential.suspended, "credential is suspended");
+        // Issue #1510: Enforce attestor independence — reject subject/issuer as attestor.
+        Self::require_attestor_independence(&env, &attestor, &credential);
         // Enforce attestation time window if configured
         if let Some(window) = env
             .storage()
@@ -10125,6 +10462,7 @@ impl QuorumProofContract {
     /// Add a holder to an issuer's whitelist.
     pub fn add_holder_to_whitelist(env: Env, issuer: Address, holder: Address) {
         issuer.require_auth();
+        Self::enforce_write_limit(&env);
         Self::require_valid_address(&env, &holder);
 
         env.storage().instance().set(
@@ -10169,6 +10507,7 @@ impl QuorumProofContract {
     /// Remove a holder from an issuer's whitelist.
     pub fn remove_holder_from_whitelist(env: Env, issuer: Address, holder: Address) {
         issuer.require_auth();
+        Self::enforce_write_limit(&env);
 
         env.storage()
             .instance()
@@ -10213,6 +10552,7 @@ impl QuorumProofContract {
         threshold: u32,
     ) {
         admin.require_auth();
+        Self::enforce_write_limit(&env);
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -10677,6 +11017,7 @@ impl QuorumProofContract {
     /// Explicitly roll back an expired attestation request.
     /// Anyone can trigger rollback once the window has passed and threshold wasn't met.
     pub fn rollback_attestation_request(env: Env, request_id: u64) {
+        Self::enforce_write_limit(&env);
         let mut request: AttestationRequest = env
             .storage()
             .instance()
@@ -10722,6 +11063,7 @@ impl QuorumProofContract {
 
     /// Check if a credential's attestation request window has expired without reaching threshold.
     pub fn check_and_rollback_attestation(env: Env, request_id: u64) -> bool {
+        Self::enforce_write_limit(&env);
         let mut request: AttestationRequest = env
             .storage()
             .instance()
@@ -11830,6 +12172,7 @@ impl QuorumProofContract {
         parent_type: Option<u32>,
     ) {
         admin.require_auth();
+        Self::enforce_write_limit(&env);
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -12297,7 +12640,7 @@ impl QuorumProofContract {
                 .storage()
                 .instance()
                 .get(&DataKey::Credential(id))
-                .unwrap();
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::CredentialNotFound));
             if credential.credential_type != type_id {
                 continue;
             }
@@ -12715,6 +13058,7 @@ impl QuorumProofContract {
     /// Panics if no pending recovery exists for the attestor.
     pub fn complete_reputation_recovery(env: Env, admin: Address, attestor: Address) {
         admin.require_auth();
+        Self::enforce_write_limit(&env);
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -14054,6 +14398,7 @@ impl QuorumProofContract {
         metadata: soroban_sdk::Bytes,
     ) {
         attestor.require_auth();
+        Self::enforce_write_limit(&env);
         // Verify the attestor has actually attested this credential
         let records: Vec<AttestationRecord> = env
             .storage()
@@ -15344,6 +15689,7 @@ impl QuorumProofContract {
     /// The amount collected (may be zero if nothing was pending).
     pub fn collect_slashed_stake(env: Env, admin: Address, attestor: Address) -> u64 {
         admin.require_auth();
+        Self::enforce_write_limit(&env);
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -16079,9 +16425,11 @@ impl QuorumProofContract {
 
     // ── Missing helper methods ────────────────────────────────────────────────
 
-    /// Update credential metrics (no-op stub for tracking purposes).
-    fn update_credential_metrics(_env: &Env, _credential_id: u64, _action: &str) {
-        // Metrics tracking stub — extend as needed
+    /// Record a credential lifecycle event against the per-action counters
+    /// exposed by `get_credential_action_counts` (issue #1390). The credential
+    /// id is not stored — the counters are aggregate, so they stay O(1).
+    fn update_credential_metrics(env: &Env, _credential_id: u64, action: &str) {
+        state_metrics::record_credential_action(env, &String::from_str(env, action));
     }
 
     /// Validate that a metadata hash is non-empty.
@@ -16420,6 +16768,7 @@ impl QuorumProofContract {
     /// Subject approves a pending consent request.
     pub fn approve_credential_request(env: Env, subject: Address, request_id: u64) {
         subject.require_auth();
+        Self::enforce_write_limit(&env);
 
         let mut request: ConsentRequest = env
             .storage()
@@ -16453,6 +16802,7 @@ impl QuorumProofContract {
         nonce: u64,
     ) -> u64 {
         issuer.require_auth();
+        Self::enforce_write_limit(&env);
 
         let request: ConsentRequest = env
             .storage()
@@ -16981,6 +17331,32 @@ impl QuorumProofContract {
         crate::rbac::get_audit_log(&env)
     }
 
+    /// Check whether an address's role assignment has passed its expiry.
+    pub fn is_role_expired(env: Env, address: Address) -> bool {
+        crate::rbac::is_role_expired(&env, &address)
+    }
+
+    /// Check whether an address's role delegation has passed its expiry.
+    pub fn is_delegation_expired(env: Env, address: Address) -> bool {
+        crate::rbac::is_delegation_expired(&env, &address)
+    }
+
+    /// Admin-only: purge an expired role assignment's storage entry.
+    /// Panics if the assignment does not exist or has not yet expired.
+    pub fn purge_expired_role(env: Env, admin: Address, address: Address) {
+        admin.require_auth();
+        Self::require_not_paused(&env);
+        crate::rbac::purge_expired_role(&env, &admin, &address);
+    }
+
+    /// Admin-only: purge an expired role delegation's storage entry.
+    /// Panics if the delegation does not exist or has not yet expired.
+    pub fn purge_expired_delegation(env: Env, admin: Address, address: Address) {
+        admin.require_auth();
+        Self::require_not_paused(&env);
+        crate::rbac::purge_expired_delegation(&env, &admin, &address);
+    }
+
     // ── BBS+ Key Escrow (#1295) ─────────────────────────────────────────
 
     /// Deposits a threshold (`threshold`-of-`guardians.len()`) Shamir-split
@@ -16999,6 +17375,31 @@ impl QuorumProofContract {
         Self::require_not_paused(&env);
         crate::rbac::require_role(&env, &issuer, rbac::Role::Issuer);
         crate::key_escrow::deposit_key_escrow(&env, &issuer, guardians, shares, threshold)
+    }
+
+    /// Replaces the guardian set, share blobs and threshold of an existing
+    /// escrow — the recovery path for a lost or compromised guardian key, or
+    /// for adding/removing a guardian. Re-splitting the key happens off-chain
+    /// exactly as for `deposit_key_escrow`. Issuer-only, and only while the
+    /// escrow has not been recovered; any in-progress recovery submissions are
+    /// cleared. See the module docs in `key_escrow.rs` for the full flow.
+    pub fn rotate_key_escrow_guardians(
+        env: Env,
+        issuer: Address,
+        new_guardians: Vec<Address>,
+        new_shares: Vec<BytesN<32>>,
+        new_threshold: u32,
+    ) -> key_escrow::KeyEscrow {
+        issuer.require_auth();
+        Self::require_not_paused(&env);
+        crate::rbac::require_role(&env, &issuer, rbac::Role::Issuer);
+        crate::key_escrow::rotate_key_escrow_guardians(
+            &env,
+            &issuer,
+            new_guardians,
+            new_shares,
+            new_threshold,
+        )
     }
 
     /// A guardian confirms it holds its share and consents to a recovery
@@ -17193,6 +17594,7 @@ impl QuorumProofContract {
         new_priority: AttestationPriority,
     ) {
         caller.require_auth();
+        Self::enforce_write_limit(&env);
         let mut entry: AttestationQueueEntry = env.storage().instance()
             .get(&DataKey3::AttestationQueueEntry(entry_id))
             .expect("queue entry not found");
@@ -17222,6 +17624,7 @@ impl QuorumProofContract {
         entry_id: u64,
     ) {
         caller.require_auth();
+        Self::enforce_write_limit(&env);
         let entry: AttestationQueueEntry = env.storage().instance()
             .get(&DataKey3::AttestationQueueEntry(entry_id))
             .expect("queue entry not found");
@@ -17250,6 +17653,7 @@ impl QuorumProofContract {
         max_entries: u32,
     ) -> u32 {
         caller.require_auth();
+        Self::enforce_write_limit(&env);
         let count: u64 = env.storage().instance()
             .get(&DataKey3::AttestationQueueCount)
             .unwrap_or(0u64);
@@ -17662,6 +18066,7 @@ impl QuorumProofContract {
         threshold: u32,
     ) -> u64 {
         creator.require_auth();
+        Self::enforce_write_limit(&env);
 
         let now = env.ledger().timestamp();
 
@@ -17766,6 +18171,7 @@ impl QuorumProofContract {
         change_description: soroban_sdk::String,
     ) {
         creator.require_auth();
+        Self::enforce_write_limit(&env);
 
         let mut template: SliceTemplate = env
             .storage()
@@ -17923,6 +18329,7 @@ impl QuorumProofContract {
         reason: soroban_sdk::String,
     ) {
         owner.require_auth();
+        Self::enforce_write_limit(&env);
 
         let now = env.ledger().timestamp();
 
@@ -17947,7 +18354,10 @@ impl QuorumProofContract {
             .expect("old attestor not in slice");
 
         // Get the weight of the old attestor
-        let attestor_weight = slice.weights.get(attestor_idx as u32).unwrap();
+        let attestor_weight = slice
+            .weights
+            .get(attestor_idx as u32)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInSlice));
 
         // Update slice
         let mut new_attestors = Vec::new(&env);
@@ -19108,16 +19518,15 @@ impl QuorumProofContract {
         slice: QuorumSlice,
         credential_type: u32,
     ) -> bool {
-        let rule: Option<CompositionRule> = env
+        let rule: CompositionRule = match env
             .storage()
             .instance()
-            .get(&DataKey11::SliceCompositionRule(credential_type));
-
-        if rule.is_none() {
-            return true;
-        }
-
-        let rule = rule.unwrap();
+            .get(&DataKey11::SliceCompositionRule(credential_type))
+        {
+            Some(rule) => rule,
+            // No composition rule configured for this credential type.
+            None => return true,
+        };
         let mut type_counts: Map<u32, u32> = Map::new(&env);
 
         for attestor_addr in slice.attestors.iter() {
@@ -19356,6 +19765,7 @@ impl QuorumProofContract {
         nonce: Bytes,
     ) -> Bytes {
         holder.require_auth();
+        Self::enforce_write_limit(&env);
 
         // Verify credential exists and is BBS+-enabled
         let bbs_cred: BbsCredential = env
@@ -27709,6 +28119,78 @@ mod doc_tests {
         assert_eq!(m.calls_in_window, 1);
     }
 
+    // ── Issue #1397: Throttling systems interaction ───────────────────────────
+
+    #[test]
+    fn test_rate_limit_whitelist_does_not_bypass_degraded_write_cap() {
+        // A rate-limit-whitelisted issuer still hits the circuit breaker's
+        // degraded write cap: whitelisting only bypasses system #2 (rate
+        // limiting), not system #1 (circuit breaker). See docs/throttling.md.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let issuer = Address::generate(&env);
+
+        client.add_rate_limit_whitelist(&admin, &issuer);
+        assert!(client.is_rate_limit_whitelisted(&issuer));
+
+        client.set_circuit_breaker_config(
+            &admin,
+            &circuit_breaker::CircuitBreakerConfig {
+                ttl_seconds: 86_400,
+                degraded_write_limit: 1,
+                auto_recover: false,
+            },
+        );
+        let reason = String::from_str(&env, "load test");
+        client.emergency_degrade(&admin, &reason);
+        assert_eq!(
+            client.get_circuit_breaker_state(),
+            circuit_breaker::CircuitBreakerState::Degraded
+        );
+
+        let subject = Address::generate(&env);
+        let metadata = Bytes::from_slice(&env, b"QmTestHash000000000000000000000000");
+
+        // First write: within the degraded-write cap (limit=1) — succeeds
+        // even though the contract is Degraded, and the whitelist means rate
+        // limiting never even gets consulted.
+        client.issue_credential(&issuer, &subject, &1u32, &metadata, &None, &0u64);
+
+        // Second write: the whitelist still bypasses rate limiting, but the
+        // circuit breaker's degraded write cap is unconditional and rejects
+        // it regardless of whitelist status.
+        let subject2 = Address::generate(&env);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.issue_credential(&issuer, &subject2, &1u32, &metadata, &None, &0u64);
+        }));
+        assert!(
+            result.is_err(),
+            "whitelisted issuer must still be rejected by the degraded write cap"
+        );
+    }
+
+    #[test]
+    fn test_get_throttling_status_combines_all_three_systems() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        client.set_rate_limit_config(&admin, &42u32, &3600u64);
+        let reason = String::from_str(&env, "combined status check");
+        client.emergency_degrade(&admin, &reason);
+
+        let status = client.get_throttling_status();
+        assert_eq!(
+            status.circuit_breaker_state,
+            circuit_breaker::CircuitBreakerState::Degraded
+        );
+        assert!(status.circuit_breaker_activation.is_some());
+        assert_eq!(status.rate_limit_max_calls, 42);
+        assert_eq!(status.rate_limit_window_seconds, 3600);
+        assert_eq!(status.congestion_level, CongestionLevel::Normal);
+    }
+
     // ── Feature (b): Admin bypass rate-limit tests ────────────────────────────
 
     #[test]
@@ -28377,6 +28859,158 @@ mod doc_tests {
         // Verify the mechanism is in place by checking the challenge exists
         let challenge = client.get_challenge(&challenge_id);
         assert_eq!(challenge.status, 0u32); // Active status
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Issue #1510: Attestor-independence enforcement tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Helper: create an initialised client + admin.
+    fn new_client(env: &Env) -> (QuorumProofContractClient<'_>, Address) {
+        let contract_id = env.register_contract(None, QuorumProofContract);
+        let client = QuorumProofContractClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize(&admin);
+        (client, admin)
+    }
+
+    /// When independence enforcement is DISABLED (default), the credential
+    /// subject is allowed to attest their own credential.
+    #[test]
+    fn test_attestor_independence_disabled_by_default_subject_can_attest() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = new_client(&env);
+
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        let metadata = Bytes::from_slice(&env, b"test_metadata_hash_1510_bbbbbb");
+        let credential_id =
+            client.issue_credential(&issuer, &subject, &1u32, &metadata, &None, &0u64);
+
+        let mut attestors = Vec::new(&env);
+        attestors.push_back(subject.clone());
+        let mut weights = Vec::new(&env);
+        weights.push_back(100u32);
+        let slice_id = client.create_slice(&issuer, &attestors, &weights, &100u32);
+
+        // Enforcement is disabled by default — subject is allowed to attest.
+        assert!(!client.is_attestor_independence_enabled());
+        client.attest(&subject, &credential_id, &slice_id, &true, &None);
+        assert!(client.is_attested(&credential_id, &slice_id));
+    }
+
+    /// When enforcement is ENABLED, the credential subject cannot attest
+    /// their own credential (panics with SubjectIsAttestor).
+    #[test]
+    #[should_panic]
+    fn test_attestor_independence_subject_blocked_when_enabled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = new_client(&env);
+
+        client.enable_attestor_independence(&admin);
+        assert!(client.is_attestor_independence_enabled());
+
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        let metadata = Bytes::from_slice(&env, b"test_metadata_hash_1510_cccccc");
+        let credential_id =
+            client.issue_credential(&issuer, &subject, &1u32, &metadata, &None, &0u64);
+
+        let mut attestors = Vec::new(&env);
+        attestors.push_back(subject.clone());
+        let mut weights = Vec::new(&env);
+        weights.push_back(100u32);
+        let slice_id = client.create_slice(&issuer, &attestors, &weights, &100u32);
+
+        // Should panic with SubjectIsAttestor
+        client.attest(&subject, &credential_id, &slice_id, &true, &None);
+    }
+
+    /// When enforcement is ENABLED, the credential issuer cannot attest
+    /// a credential they issued (panics with IssuerIsAttestor).
+    #[test]
+    #[should_panic]
+    fn test_attestor_independence_issuer_blocked_when_enabled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = new_client(&env);
+
+        client.enable_attestor_independence(&admin);
+
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        let metadata = Bytes::from_slice(&env, b"test_metadata_hash_1510_dddddd");
+        let credential_id =
+            client.issue_credential(&issuer, &subject, &1u32, &metadata, &None, &0u64);
+
+        let mut attestors = Vec::new(&env);
+        attestors.push_back(issuer.clone());
+        let mut weights = Vec::new(&env);
+        weights.push_back(100u32);
+        let slice_id = client.create_slice(&subject, &attestors, &weights, &100u32);
+
+        // Should panic with IssuerIsAttestor
+        client.attest(&issuer, &credential_id, &slice_id, &true, &None);
+    }
+
+    /// When enforcement is ENABLED, a genuine third-party attestor is still
+    /// allowed to attest — the happy path must not be broken.
+    #[test]
+    fn test_attestor_independence_third_party_allowed_when_enabled() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = new_client(&env);
+
+        client.enable_attestor_independence(&admin);
+
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        let third_party = Address::generate(&env);
+        let metadata = Bytes::from_slice(&env, b"test_metadata_hash_1510_fffff");
+        let credential_id =
+            client.issue_credential(&issuer, &subject, &1u32, &metadata, &None, &0u64);
+
+        let mut attestors = Vec::new(&env);
+        attestors.push_back(third_party.clone());
+        let mut weights = Vec::new(&env);
+        weights.push_back(100u32);
+        let slice_id = client.create_slice(&issuer, &attestors, &weights, &100u32);
+
+        // Third-party attestor is independent — should succeed.
+        client.attest(&third_party, &credential_id, &slice_id, &true, &None);
+        assert!(client.is_attested(&credential_id, &slice_id));
+    }
+
+    /// `disable_attestor_independence` reverts enforcement so a previously-
+    /// blocked subject can attest again after the flag is turned off.
+    #[test]
+    fn test_attestor_independence_can_be_disabled_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = new_client(&env);
+
+        client.enable_attestor_independence(&admin);
+        assert!(client.is_attestor_independence_enabled());
+        client.disable_attestor_independence(&admin);
+        assert!(!client.is_attestor_independence_enabled());
+
+        let issuer = Address::generate(&env);
+        let subject = Address::generate(&env);
+        let metadata = Bytes::from_slice(&env, b"test_metadata_hash_1510_eeeeee");
+        let credential_id =
+            client.issue_credential(&issuer, &subject, &1u32, &metadata, &None, &0u64);
+
+        let mut attestors = Vec::new(&env);
+        attestors.push_back(subject.clone());
+        let mut weights = Vec::new(&env);
+        weights.push_back(100u32);
+        let slice_id = client.create_slice(&issuer, &attestors, &weights, &100u32);
+
+        // Flag is now off — subject may attest.
+        client.attest(&subject, &credential_id, &slice_id, &true, &None);
+        assert!(client.is_attested(&credential_id, &slice_id));
     }
 }
 
