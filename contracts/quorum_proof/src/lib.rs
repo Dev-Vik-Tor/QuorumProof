@@ -24,6 +24,7 @@ pub mod upgrade_history;
 pub mod atomic_operations;
 pub mod attestation_veto;
 pub mod migration_v2;
+pub mod range_proofs;
 #[cfg(test)]
 mod simulation_agent_based;
 #[cfg(test)]
