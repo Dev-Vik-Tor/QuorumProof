@@ -25,6 +25,7 @@ pub mod atomic_operations;
 pub mod attestation_veto;
 pub mod migration_v2;
 pub mod range_proofs;
+pub mod credential_compartmentalization;
 #[cfg(test)]
 mod simulation_agent_based;
 #[cfg(test)]
