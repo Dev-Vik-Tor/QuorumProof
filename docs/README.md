@@ -70,6 +70,10 @@ Then see [`../README.md`](../README.md) for the contribution workflow and
 | [ide-setup.md](./ide-setup.md) | VS Code extension recommendations, workspace settings, debug configurations, and tasks for contract and API development (issue #1664). |
 | [code-snippets.md](./code-snippets.md) | Code snippets library for common Soroban smart contract and client SDK patterns (issue #1670). |
 | [environment-parity.md](./environment-parity.md) | Detecting and remediating env/config drift between environments using check_env_parity.sh and compare_environments.sh (issue #1662). |
+| [DOCUMENTATION_SEARCH.md](./DOCUMENTATION_SEARCH.md) | Client-side documentation indexing and search architecture, including index generation and integration patterns. |
+| [git-workflow.md](./git-workflow.md) | Branching strategy, PR guidelines, commit message conventions, and merge strategy (issue #1675). |
+
+---
 
 ---
 
