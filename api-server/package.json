@@ -17,6 +17,8 @@
     "migrate": "tsx src/migrations/cli.ts up",
     "migrate:rollback": "tsx src/migrations/cli.ts down",
     "openapi:generate": "tsx scripts/generate-openapi-spec.ts",
+    "schema:diagram": "tsx scripts/generate-schema-diagram.ts",
+    "schema:diagram:check": "tsx scripts/generate-schema-diagram.ts --check",
     "generate:client": "npm run openapi:generate && openapi-ts"
   },
   "dependencies": {
