@@ -157,3 +157,6 @@ VERIFICATION_CHECKLIST.md
 
 # Longevity test output (#1632)
 longevity-reports/
+
+# Issue #1676: local development env files (only the .example is committed)
+api-server/.env.development
